@@ -52,8 +52,31 @@ async def init_db():
         await db.execute("CREATE TABLE IF NOT EXISTS processed_lots (lot_id TEXT PRIMARY KEY)")
         await db.commit()
 
-async def fetch_recent_lots(limit: int = 25) -> List[Dict]:
-    """Пробуем сначала JSON, потом Excel"""
+async def fetch_with_retry(url: str, params: dict, headers: dict, max_retries: int = 5) -> httpx.Response | None:
+    """Ретраи + игнорирование SSL + длинный таймаут"""
+    for attempt in range(max_retries):
+        try:
+            timeout = 40 + (attempt * 20)   # 40 → 60 → 80 → 100 → 120 сек
+            async with httpx.AsyncClient(
+                timeout=timeout,
+                verify=False,                    # ← Игнорируем проблемы с SSL-сертификатом
+                follow_redirects=True
+            ) as client:
+                resp = await client.get(url, params=params, headers=headers)
+                return resp
+        except (httpx.ConnectTimeout, httpx.ReadTimeout, httpx.ConnectError) as e:
+            logger.warning(f"Попытка {attempt + 1}/{max_retries} — таймаут: {type(e).__name__}")
+            if attempt < max_retries - 1:
+                await asyncio.sleep(4 + attempt * 3)
+            else:
+                logger.error(f"Все попытки исчерпаны: {e}")
+                return None
+        except Exception as e:
+            logger.error(f"Неизвестная ошибка: {e}\n{traceback.format_exc()}")
+            return None
+    return None
+
+async def fetch_recent_lots(limit: int = 20) -> List[Dict]:
     params = {
         "lotStatus": "PUBLISHED,APPLICATIONS_SUBMISSION,DETERMINING_WINNER",
         "byFirstVersion": "true",
@@ -65,42 +88,37 @@ async def fetch_recent_lots(limit: int = 25) -> List[Dict]:
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
         "Accept": "application/json, text/plain, */*",
         "Referer": f"{TORGI_BASE}/new/public/lots/reg",
-        "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Accept-Language": "ru-RU,ru;q=0.9",
     }
 
-    # === Попытка 1: JSON эндпоинт ===
-    try:
-        async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
-            resp = await client.get(LOTCARDS_API, params=params, headers=headers)
-            logger.info(f"JSON API Status: {resp.status_code}")
-            if resp.status_code == 200:
-                data = resp.json()
-                items = data.get("content", []) if isinstance(data, dict) else data
-                logger.info(f"JSON: получено {len(items)} записей")
-                lots = [normalize_lot(item) for item in items if normalize_lot(item)]
-                if lots:
-                    return lots
-    except Exception as e:
-        logger.error(f"JSON API Exception: {e}\n{traceback.format_exc()}")
-
-    # === Попытка 2: Excel экспорт ===
-    try:
-        async with httpx.AsyncClient(timeout=40, follow_redirects=True) as client:
-            resp = await client.get(EXPORT_API, params=params, headers=headers)
-            logger.info(f"Excel API Status: {resp.status_code}")
-            if resp.status_code == 200 and "excel" in resp.headers.get("content-type", "").lower():
-                df = pd.read_excel(io.BytesIO(resp.content))
-                logger.info(f"Excel: получено {len(df)} строк")
-                lots = []
-                for _, row in df.head(limit).iterrows():
-                    lot = normalize_row(row)
-                    if lot:
-                        lots.append(lot)
+    # === JSON ===
+    resp = await fetch_with_retry(LOTCARDS_API, params, headers)
+    if resp and resp.status_code == 200:
+        try:
+            data = resp.json()
+            items = data.get("content", []) if isinstance(data, dict) else data
+            lots = [normalize_lot(item) for item in items if normalize_lot(item)]
+            if lots:
+                logger.info(f"JSON успех: {len(lots)} лотов")
                 return lots
-            else:
-                logger.error(f"Excel response (первые 500 символов): {resp.text[:500]}")
-    except Exception as e:
-        logger.error(f"Excel API Exception: {e}\n{traceback.format_exc()}")
+        except Exception as e:
+            logger.warning(f"Ошибка парсинга JSON: {e}")
+
+    # === Excel ===
+    resp = await fetch_with_retry(EXPORT_API, params, headers)
+    if resp and resp.status_code == 200:
+        try:
+            df = pd.read_excel(io.BytesIO(resp.content))
+            lots = []
+            for _, row in df.head(limit).iterrows():
+                lot = normalize_row(row)
+                if lot:
+                    lots.append(lot)
+            if lots:
+                logger.info(f"Excel успех: {len(lots)} лотов")
+                return lots
+        except Exception as e:
+            logger.error(f"Ошибка парсинга Excel: {e}")
 
     return []
 
@@ -121,18 +139,9 @@ def normalize_lot(raw: dict) -> Dict | None:
 def normalize_row(row) -> Dict | None:
     try:
         lot_id = str(row.iloc[0] if hasattr(row, 'iloc') else row.get("ID", "")).strip()
-        if not lot_id or lot_id == "nan": return None
+        if not lot_id or lot_id in ["nan", ""]: return None
         name = str(row.get("Наименование", "") or row.get("name", ""))[:180]
-        area = None
-        for col in row.index:
-            if "площадь" in str(col).lower() or "area" in str(col).lower():
-                try:
-                    area = float(row[col])
-                    break
-                except:
-                    pass
-        if area is None:
-            area = parse_area(name)
+        area = parse_area(name)
         return {
             "id": lot_id,
             "name": name,
@@ -151,15 +160,15 @@ def parse_area(text: str):
 @dp.message(CommandStart())
 async def cmd_start(message: Message):
     if message.chat.id != CHAT_ID: return
-    await message.answer("✅ Бот запущен. /debug — проверить лоты")
+    await message.answer("✅ Бот запущен (с ретраями + игнор SSL)")
 
 @dp.message(Command("debug"))
 async def cmd_debug(message: Message):
     if message.chat.id != CHAT_ID: return
-    await message.answer("🔍 Пробую получить лоты (JSON + Excel)...")
+    await message.answer("🔍 Пробую получить лоты (с ретраями)...")
     lots = await fetch_recent_lots(12)
     if not lots:
-        await message.answer("❌ Лотов не получено. Смотри логи в Render.")
+        await message.answer("❌ Лотов нет. Смотри логи в Render.")
         return
     text = "📋 Последние лоты:\n\n"
     for lot in lots:
@@ -172,7 +181,7 @@ async def start_bot():
     scheduler = AsyncIOScheduler()
     scheduler.add_job(check_new_lots, IntervalTrigger(minutes=CHECK_INTERVAL_MINUTES), args=[bot])
     scheduler.start()
-    await asyncio.sleep(8)
+    await asyncio.sleep(10)
     await check_new_lots(bot)
     await dp.start_polling(bot)
 
@@ -181,5 +190,5 @@ async def check_new_lots(bot: Bot):
     logger.info(f"Проверено {len(lots)} лотов")
 
 if __name__ == "__main__":
-    logger.info("🚀 Запуск (диагностический режим)")
+    logger.info("🚀 Запуск (ретраи + verify=False)")
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 10000)))
