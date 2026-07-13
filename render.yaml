@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: torgi-monitor-bot
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: CHAT_ID
+        sync: false
+      - key: CHECK_INTERVAL_MINUTES
+        value: "5"
+      - key: LOG_LEVEL
+        value: "INFO"
+    autoDeploy: true
